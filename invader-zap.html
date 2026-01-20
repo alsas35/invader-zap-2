@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Invader Zap - Boss Edition</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <style>
+        body { margin:0; overflow:hidden; background:#000; font-family: 'Arial Black', Arial, sans-serif; color:#0ff; font-weight:bold; }
+        #ui { position:absolute; top:20px; left:20px; z-index:100; font-size:20px; text-shadow: 0 0 10px #0ff; pointer-events: none; }
+        #bossUI { position:absolute; top:20px; right:20px; width:240px; display:none; }
+        #bossBar { width:100%; height:20px; border:3px solid #f0f; background:#000; position:relative; overflow:hidden; }
+        #bossFill { width:100%; height:100%; background:linear-gradient(90deg, #f0f, #f09); transition: width 0.25s; }
+        #gameOver { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); text-align:center; font-size:36px; display:none; background:rgba(0,0,20,0.92); padding:50px; border-radius:20px; border: 3px solid #0ff; box-shadow: 0 0 40px #0ff; z-index: 200; }
+        #gameOver button { font-size:28px; padding:18px 40px; background:#0ff; color:#000; border:none; border-radius:12px; cursor:pointer; font-weight:bold; margin-top:25px; pointer-events: auto; }
+        #gameOver button:hover { background:#fff; transform:scale(1.08); }
+        canvas { cursor:none; touch-action: none; image-rendering: pixelated; }
+    </style>
+</head>
+<body>
+    <div id="ui">
+        <div>SCORE: <span id="score">0</span></div>
+        <div>LIVES: <span id="lives">3</span></div>
+        <div>WAVE: <span id="wave">1</span></div>
+    </div>
+    <div id="bossUI">
+        <div style="color:#f0f; font-size:16px; margin-bottom:6px;">BOSS INTEGRITY</div>
+        <div id="bossBar"><div id="bossFill"></div></div>
+    </div>
+    <div id="gameOver">
+        <div>🛸 MISSION FAILED 🛸</div>
+        <div style="font-size:28px;margin:25px 0;">GAME OVER</div>
+        <div style="font-size:22px;margin-bottom:35px;">Final Score: <span id="finalScore">0</span></div>
+        <button id="restartBtn">REBOOT SYSTEM</button>
+    </div>
+
+<script type="module">
+    import * as THREE from 'https://cdn.skypack.dev/three@0.136.0';
+
+    let score = 0, lives = 3, wave = 1, numInvaders = 0, gameActive = true;
+    let playerPos = new THREE.Vector3(0, -4.2, 0);
+    let fleet = { dir: 1, lastDir: 1 };
+    let fleetVel = new THREE.Vector3();
+    let pendingParticles = [];
+    let particles = [];
+    let isBossWave = false;
+    let bossHealth = 0;
+    let bossMaxHealth = 0;
+
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.z = 7.5;
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    document.body.appendChild(renderer.domElement);
+
+    const starGeo = new THREE.BufferGeometry();
+    const starCoords = [];
+    for(let i = 0; i < 2500; i++) {
+        starCoords.push((Math.random()-0.5)*30, (Math.random()-0.5)*30, (Math.random()-1)*10-2);
+    }
+    starGeo.setAttribute('position', new THREE.Float32BufferAttribute(starCoords, 3));
+    const starMat = new THREE.PointsMaterial({ color: 0x8888ff, size: 0.025, transparent:true, opacity:0.7 });
+    const stars = new THREE.Points(starGeo, starMat);
+    scene.add(stars);
+
+    const raycaster = new THREE.Raycaster();
+    const plane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
+
+    function screenToWorld(clientX, clientY) {
+        const ndc = new THREE.Vector2(
+            (clientX / window.innerWidth) * 2 - 1,
+            -(clientY / window.innerHeight) * 2 + 1
+        );
+        raycaster.setFromCamera(ndc, camera);
+        const point = new THREE.Vector3();
+        raycaster.ray.intersectPlane(plane, point);
+        return point;
+    }
+
+    class Particle {
+        constructor(pos, vel, color, lifetime, type = 'trail') {
+            this.pos = pos.clone();
+            this.vel = vel.clone();
+            this.origColor = color.clone();
+            this.color = color.clone();
+            this.lifetime = lifetime;
+            this.age = 0;
+            this.type = type;
+            this.shootTimer = 0;
+            this.isBossCore = false;
+        }
+        update(dt) {
+            this.age += dt;
+            if (this.lifetime !== Infinity && this.age >= this.lifetime) return false;
+
+            if (this.type === 'invader' || this.type === 'boss') {
+                this.pos.addScaledVector(fleetVel, dt);
+                this.shootTimer += dt;
+
+                const shootFreq = isBossWave ? 1.8 : 2.2 - wave*0.12;
+                if (this.shootTimer > shootFreq && Math.random() < dt * (0.6 + wave*0.08)) {
+                    if (this.type === 'boss' && this.isBossCore) {
+                        spawnBossPattern(this.pos.clone());
+                    } else if (this.type !== 'boss') {
+                        spawnEnemyBullet(this.pos.clone());
+                    }
+                    this.shootTimer = 0;
+                }
+                const pulse = 0.7 + Math.sin(this.age * (this.type === 'boss' ? 12 : 7)) * 0.3;
+                this.color.copy(this.origColor).multiplyScalar(pulse);
+                return true;
+            }
+
+            this.pos.addScaledVector(this.vel, dt);
+            const alpha = 1 - (this.age / this.lifetime);
+            this.color.copy(this.origColor).multiplyScalar(alpha);
+            return true;
+        }
+    }
+
+    function spawnParticle(pos, vel, color, lifetime, type) {
+        pendingParticles.push(new Particle(pos, vel, color, lifetime, type));
+    }
+
+    function spawnPlayerBullet(pos) {
+        const spread = 0.35;
+        for (let i = -2; i <= 2; i++) {
+            const vel = new THREE.Vector3(i * spread, 7 + Math.abs(i)*0.8, 0);
+            spawnParticle(pos, vel, new THREE.Color(0.1, 1, 1), 1.4, 'playerBullet');
+        }
+    }
+
+    function spawnEnemyBullet(pos) {
+        spawnParticle(pos, new THREE.Vector3((Math.random()-0.5)*0.6, -5, 0), new THREE.Color(1, 0.1, 0.1), 2.8, 'enemyBullet');
+    }
+
+    function spawnBossPattern(pos) {
+        const now = Date.now() * 0.003;
+        for(let i = 0; i < 10; i++) {
+            const angle = (i/10) * Math.PI * 2 + now;
+            const speed = 3.2 + Math.sin(now*2 + i)*0.8;
+            const vel = new THREE.Vector3(Math.cos(angle)*speed, Math.sin(angle)*speed, 0);
+            spawnParticle(pos, vel, new THREE.Color(1, 0.2, 0.9), 3.2, 'enemyBullet');
+        }
+    }
+
+    function spawnExplosion(pos, color) {
+        for (let i = 0; i < 40; i++) {
+            const angle = Math.random() * Math.PI * 2;
+            const speed = 2 + Math.random() * 5;
+            spawnParticle(pos, new THREE.Vector3(Math.cos(angle)*speed, Math.sin(angle)*speed, 0),
+                         color || new THREE.Color(1, 0.6, 0.1), 0.9, 'trail');
+        }
+    }
+
+    function spawnGrid() {
+        numInvaders = 0;
+        isBossWave = (wave % 5 === 0);
+
+        if (isBossWave) {
+            document.getElementById('bossUI').style.display = 'block';
+            bossMaxHealth = 60 + wave * 15;
+            bossHealth = bossMaxHealth;
+            updateBossBar();
+
+            for(let i = 0; i < 80; i++) {
+                const angle = Math.random() * Math.PI * 2;
+                const dist = 0.3 + Math.random() * 1.1;
+                const pos = new THREE.Vector3(Math.cos(angle)*dist, 3.5 + Math.sin(angle)*dist*0.4, 0);
+                const p = new Particle(pos, new THREE.Vector3(), new THREE.Color(0.9, 0.1, 1), Infinity, 'boss');
+                if (i < 8) p.isBossCore = true;
+                particles.push(p);
+                numInvaders++;
+            }
+        } else {
+            document.getElementById('bossUI').style.display = 'none';
+            const rows = 4, cols = 7 + Math.min(wave, 5);
+            for (let r = 0; r < rows; r++) {
+                for (let c = 0; c < cols; c++) {
+                    const x = -4.2 + c * (8.4 / (cols - 1));
+                    const y = 4.2 - r * 0.75;
+                    particles.push(new Particle(new THREE.Vector3(x, y, 0), new THREE.Vector3(), 
+                                               new THREE.Color().setHSL(0.55 - r*0.08, 1, 0.55), Infinity, 'invader'));
+                    numInvaders++;
+                }
+            }
+        }
+    }
+
+    function updateBossBar() {
+        document.getElementById('bossFill').style.width = (bossHealth / bossMaxHealth * 100) + '%';
+    }
+
+    const MAX_PARTICLES = 32000;
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(MAX_PARTICLES * 3), 3));
+    geometry.setAttribute('color', new THREE.BufferAttribute(new Float32Array(MAX_PARTICLES * 3), 3));
+    const material = new THREE.PointsMaterial({
+        size: 0.085,
+        vertexColors: true,
+        transparent: true,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false
+    });
+    const points = new THREE.Points(geometry, material);
+    scene.add(points);
+
+    function updateFleet() {
+        let left = 10, right = -10;
+        let hasInvaders = false;
+        particles.forEach(p => {
+            if (p.type === 'invader' || p.type === 'boss') {
+                left = Math.min(left, p.pos.x);
+                right = Math.max(right, p.pos.x);
+                hasInvaders = true;
+            }
+        });
+        if (!hasInvaders) return;
+
+        if (left < -4.8) fleet.dir = 1;
+        if (right > 4.8) fleet.dir = -1;
+
+        let speedMult = isBossWave ? 1.6 : 0.9 + wave * 0.22;
+        fleetVel.set(
+            fleet.dir * 0.025 * (isBossWave ? 1.7 : 1),
+            -0.008 * speedMult,
+            0
+        );
+
+        if (fleet.lastDir !== fleet.dir) {
+            fleetVel.y -= 0.08;
+        }
+        fleet.lastDir = fleet.dir;
+    }
+
+    function handleCollisions() {
+        if (!gameActive) return;
+
+        for (let i = particles.length - 1; i >= 0; i--) {
+            const p = particles[i];
+
+            if (p.type === 'playerBullet') {
+                for (let j = particles.length - 1; j >= 0; j--) {
+                    const target = particles[j];
+                    if ((target.type === 'invader' || target.type === 'boss') &&
+                        p.pos.distanceTo(target.pos) < 0.45) {
+
+                        p.age = p.lifetime;
+
+                        if (target.type === 'boss') {
+                            if (target.isBossCore) {
+                                bossHealth -= 3;
+                                if (bossHealth <= 0) {
+                                    spawnExplosion(target.pos, new THREE.Color(1, 0.3, 1));
+                                    particles.forEach(part => {
+                                        if(part.type === 'boss') part.lifetime = 0.02;
+                                    });
+                                    numInvaders = 0;
+                                    score += 8000 + wave * 1000;
+                                }
+                            }
+                        } else {
+                            spawnExplosion(target.pos, target.color);
+                            target.lifetime = 0.02;
+                            numInvaders--;
+                            score += 100 + wave * 8;
+                        }
+
+                        updateUI();
+                        if (numInvaders <= 0) {
+                            wave++;
+                            setTimeout(spawnGrid, 1400);
+                        }
+                        break;
+                    }
+                }
+            }
+
+            if (p.type === 'enemyBullet' && p.pos.distanceTo(playerPos) < 0.35) {
+                p.age = p.lifetime;
+                lives--;
+                spawnExplosion(playerPos, new THREE.Color(0.1, 1, 1));
+                updateUI();
+                if (lives <= 0) gameOverFunc();
+            }
+        }
+    }
+
+    function updateUI() {
+        document.getElementById('score').textContent = score;
+        document.getElementById('lives').textContent = lives;
+        document.getElementById('wave').textContent = wave;
+    }
+
+    function gameOverFunc() {
+        gameActive = false;
+        document.getElementById('finalScore').textContent = score;
+        document.getElementById('gameOver').style.display = 'block';
+        document.getElementById('bossUI').style.display = 'none';
+    }
+
+    function resetGame() {
+        particles = [];
+        pendingParticles = [];
+        score = 0;
+        lives = 3;
+        wave = 1;
+        gameActive = true;
+        fleet = { dir: 1, lastDir: 1 };
+        playerPos.set(0, -4.2, 0);
+        document.getElementById('gameOver').style.display = 'none';
+        updateUI();
+        spawnGrid();
+    }
+
+    document.addEventListener('mousemove', e => {
+        if (!gameActive) return;
+        const world = screenToWorld(e.clientX, e.clientY);
+        playerPos.x = THREE.MathUtils.clamp(world.x, -6, 6);
+    });
+
+    document.addEventListener('mousedown', () => {
+        if(gameActive) spawnPlayerBullet(playerPos);
+    });
+
+    document.addEventListener('touchstart', e => {
+        e.preventDefault();
+        if(gameActive) {
+            const touch = e.touches[0];
+            const world = screenToWorld(touch.clientX, touch.clientY);
+            playerPos.x = THREE.MathUtils.clamp(world.x, -5.5, 5.5);
+            spawnPlayerBullet(playerPos);
+        }
+    }, { passive: false });
+
+    const clock = new THREE.Clock();
+function animate() {
+        requestAnimationFrame(animate);
+        const dt = Math.min(clock.getDelta(), 0.12);
+
+        if (gameActive) {
+            updateFleet();
+            handleCollisions();
+            spawnParticle(playerPos.clone().add(new THREE.Vector3(0, 0.25, 0)), new THREE.Vector3(), new THREE.Color(0.1, 1, 1), 0.05, 'trail');
+            spawnParticle(playerPos.clone().add(new THREE.Vector3(-0.22, -0.15, 0)), new THREE.Vector3(), new THREE.Color(0, 0.9, 1), 0.05, 'trail');
+            spawnParticle(playerPos.clone().add(new THREE.Vector3(0.22, -0.15, 0)), new THREE.Vector3(), new THREE.Color(0, 0.9, 1), 0.05, 'trail');
+            
+            if (Math.random() > 0.5) {
+                const offset = (Math.random() - 0.5) * 0.2;
+                spawnParticle(
+                    playerPos.clone().add(new THREE.Vector3(offset, -0.35, 0)),
+                    new THREE.Vector3(offset, -2, 0),
+                    new THREE.Color(1, 0.5, 0.1),
+                    0.15,
+                    'trail'
+                );
+            }
+
+            stars.position.y -= dt * 0.6;
+            if (stars.position.y < -8) stars.position.y += 16;
+        }
+
+        particles = particles.filter(p => p.update(dt));
+        while(pendingParticles.length) particles.push(pendingParticles.shift());
+
+        const posArr = geometry.attributes.position.array;
+        const colArr = geometry.attributes.color.array;
+        let count = 0;
+
+        particles.forEach(p => {
+            if (count < MAX_PARTICLES) {
+                const i = count * 3;
+                posArr[i]     = p.pos.x;
+                posArr[i + 1] = p.pos.y;
+                posArr[i + 2] = p.pos.z;
+                colArr[i]     = p.color.r;
+                colArr[i + 1] = p.color.g;
+                colArr[i + 2] = p.color.b;
+                count++;
+            }
+        });
+
+    geometry.attributes.position.needsUpdate = true;
+    geometry.attributes.color.needsUpdate = true;
+    geometry.setDrawRange(0, count);
+
+    renderer.render(scene, camera);
+}
+
+    document.getElementById('restartBtn').onclick = resetGame;
+
+    spawnGrid();
+    animate();
+
+    window.addEventListener('resize', () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+</script>
+</body>
+</html>
